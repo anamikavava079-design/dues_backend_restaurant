@@ -2559,8 +2559,8 @@ Customer:
 """
 
         # =====================================
-# ASK QWEN THROUGH HUGGING FACE
-# =====================================
+        # ASK QWEN THROUGH HUGGING FACE
+        # =====================================
 
         hf_token = os.getenv("HF_TOKEN")
 
@@ -2584,9 +2584,9 @@ Customer:
              timeout=60,
 )
 
-response.raise_for_status()
+        response.raise_for_status()
 
-reply = response.json()["choices"][0]["message"]["content"].strip()
+        reply = response.json()["choices"][0]["message"]["content"].strip()
         
 
         # =====================================
