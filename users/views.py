@@ -1807,19 +1807,20 @@ def handle_submit_feedback(customer_id, message, message_lower):
 
 
 def handle_checkout_cart(customer_id):
-    """PDF requirement: cart-like flow should end in an actual order being
-    placed ('Accept payment directly within chat'). This creates a real
-    Order + OrderItems from the customer's Cart and clears the cart.
-
-    Payment gateway (Razorpay/Stripe) capture itself is NOT implemented
-    here -- that needs a gateway account/API keys and should happen via a
-    secure, dedicated payment endpoint (never collect card numbers
-    directly in this view). This function stops at "order placed,
-    payment pending" so the flow is otherwise complete end-to-end.
     """
+    Prepare the customer's cart for checkout.
+
+    This function does NOT create an order and does NOT clear the cart.
+    The actual order should only be created after the customer confirms
+    delivery details and payment on the checkout page.
+    """
+
     if not customer_id:
         return Response(
-            {"reply": "Please login first to checkout.", "action": "GO_TO_CHECKOUT"},
+            {
+                "reply": "Please login first to continue to checkout.",
+                "action": "GO_TO_CHECKOUT",
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -1827,30 +1828,32 @@ def handle_checkout_cart(customer_id):
 
     if not customer:
         return Response(
-            {"reply": "Customer account not found."}, status=status.HTTP_200_OK
+            {"reply": "Customer account not found."},
+            status=status.HTTP_200_OK,
         )
 
     cart = Cart.objects.filter(customer=customer).first()
 
     if not cart or not cart.items.exists():
         return Response(
-            {"reply": "Your cart is empty. Add some items before checking out."},
+            {
+                "reply": "Your cart is empty. Add some items before checking out."
+            },
             status=status.HTTP_200_OK,
         )
 
-    restaurant = Restaurant.objects.first()
-
-    if not restaurant:
-        return Response(
-            {"reply": "Sorry, checkout isn't available right now."},
-            status=status.HTTP_200_OK,
-        )
-
-    # Guard against items that went unavailable while sitting in the cart.
-    unavailable = [ci for ci in cart.items.all() if not ci.menu_item.is_available]
+    # Check whether any cart item became unavailable
+    unavailable = [
+        cart_item
+        for cart_item in cart.items.all()
+        if not cart_item.menu_item.is_available
+    ]
 
     if unavailable:
-        names = ", ".join(ci.menu_item.name for ci in unavailable)
+        names = ", ".join(
+            cart_item.menu_item.name for cart_item in unavailable
+        )
+
         return Response(
             {
                 "reply": (
@@ -1861,45 +1864,35 @@ def handle_checkout_cart(customer_id):
             status=status.HTTP_200_OK,
         )
 
-    order = Order.objects.create(customer=customer, restaurant=restaurant, total_price=0)
-
+    # Build cart summary without creating an order
     total = 0
     lines = []
 
     for cart_item in cart.items.all():
-        OrderItem.objects.create(
-            order=order,
-            menu_item=cart_item.menu_item,
-            quantity=cart_item.quantity,
-            price=cart_item.menu_item.price,
-            customization=cart_item.customization,
-        )
         subtotal = float(cart_item.menu_item.price) * cart_item.quantity
         total += subtotal
-        lines.append(f"{cart_item.quantity} x {cart_item.menu_item.name}")
 
-    order.total_price = total
-    order.save()
-
-    cart.items.all().delete()
+        lines.append(
+            f"{cart_item.quantity} x {cart_item.menu_item.name} "
+            f"- ₹{subtotal:.2f}"
+        )
 
     reply = (
-        "\U0001F4B3 Order placed! Here's your summary:\n\n"
+        "🛒 Your cart is ready for checkout!\n\n"
         + "\n".join(lines)
-        + f"\n\nTotal: \u20B9{total:.2f}\n\n"
-        "Proceed to payment to confirm your order."
+        + f"\n\nTotal: ₹{total:.2f}\n\n"
+        + "Please continue to checkout to enter your delivery details "
+          "and choose your payment method."
     )
 
     return Response(
         {
             "reply": reply,
-            "order_id": order.id,
             "total_price": total,
-            "action": "GO_TO_PAYMENT",
+            "action": "GO_TO_CHECKOUT",
         },
-        status=status.HTTP_201_CREATED,
+        status=status.HTTP_200_OK,
     )
-
 
 def handle_join_waitlist(customer_id, message_lower):
     if not customer_id:
