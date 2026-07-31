@@ -1,0 +1,167 @@
+[
+{
+  "model": "users.restaurant",
+  "pk": 1,
+  "fields": {
+    "name": "FoodBot Restaurant",
+    "brand": "FoodBot",
+    "cuisine": "Multi Cuisine",
+    "type": "Casual Dining",
+    "description": "Delicious food served fresh",
+    "owner_name": "Anamika",
+    "phone": "9876543210",
+    "email": "foodbot@gmail.com",
+    "address": "Bengaluru",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "open_time": "06:00:00",
+    "close_time": "00:00:00",
+    "prep_time": 30,
+    "delivery_radius_km": 10,
+    "seating_capacity": 50,
+    "gstin": "GST123456",
+    "fssai": "FSSAT123456",
+    "source": "Website",
+    "dietary_options_offered": [],
+    "channels_to_activate": [],
+    "payment_methods_offered": [
+      "Cash",
+      "UPI",
+      "Credit/Debit Card"
+    ],
+    "parking_info": "[Free parking available at the venue]",
+    "delivery_areas": [
+      "Kannur",
+      "Tellicherry",
+      "Vadakara"
+    ],
+    "created_at": "2026-07-17T09:14:17.537Z"
+  }
+},
+{
+  "model": "users.menuitem",
+  "pk": 1,
+  "fields": {
+    "restaurant": 1,
+    "name": "Classic Burger",
+    "category": "Burger",
+    "description": "Juicy grilled burger with fresh vegetables and cheese.",
+    "price": "249.00",
+    "is_available": true,
+    "is_veg": false,
+    "is_vegan": false,
+    "is_spicy": false,
+    "calories": 520,
+    "allergens": [
+      "Glutan",
+      "Egg"
+    ],
+    "image": "https://images.unsplash.com/photo-1568901346375-23c9450c58cd?w=600",
+    "created_at": "2026-07-17T09:18:58.718Z"
+  }
+},
+{
+  "model": "users.menuitem",
+  "pk": 2,
+  "fields": {
+    "restaurant": 1,
+    "name": "Cheese Pizza",
+    "category": "Pizza",
+    "description": "Tasty",
+    "price": "399.00",
+    "is_available": true,
+    "is_veg": true,
+    "is_vegan": false,
+    "is_spicy": false,
+    "calories": 285,
+    "allergens": [
+      "Glutan",
+      "Diary"
+    ],
+    "image": "https://images.unsplash.com/photo-1513104890138-7c749659a591?w=600",
+    "created_at": "2026-07-17T09:57:59.393Z"
+  }
+},
+{
+  "model": "users.menuitem",
+  "pk": 3,
+  "fields": {
+    "restaurant": 1,
+    "name": "Italian Pasta",
+    "category": "Pasta",
+    "description": "Delicious",
+    "price": "299.00",
+    "is_available": true,
+    "is_veg": false,
+    "is_vegan": false,
+    "is_spicy": true,
+    "calories": 160,
+    "allergens": [],
+    "image": "https://images.unsplash.com/photo-1621996346565-e3dbc646d9a9?w=600",
+    "created_at": "2026-07-17T09:59:01.609Z"
+  }
+},
+{
+  "model": "users.menuitem",
+  "pk": 4,
+  "fields": {
+    "restaurant": 1,
+    "name": "Cold Coffee",
+    "category": "Drink",
+    "description": "Fresh",
+    "price": "149.00",
+    "is_available": true,
+    "is_veg": true,
+    "is_vegan": false,
+    "is_spicy": false,
+    "calories": 180,
+    "allergens": [
+      "Milk"
+    ],
+    "image": "https://images.unsplash.com/photo-1461023058943-07fcbe16d735?w=600",
+    "created_at": "2026-07-17T10:00:18.304Z"
+  }
+},
+{
+  "model": "users.menuitem",
+  "pk": 5,
+  "fields": {
+    "restaurant": 1,
+    "name": "Chocolate Cake",
+    "category": "Dessert",
+    "description": "Sweet delicious",
+    "price": "199.00",
+    "is_available": true,
+    "is_veg": false,
+    "is_vegan": false,
+    "is_spicy": false,
+    "calories": 420,
+    "allergens": [
+      "Glutan",
+      "Diary",
+      "Egg"
+    ],
+    "image": "https://images.unsplash.com/photo-1578985545062-69928b1d9587?w=600",
+    "created_at": "2026-07-17T10:01:22.143Z"
+  }
+},
+{
+  "model": "users.menuitem",
+  "pk": 6,
+  "fields": {
+    "restaurant": 1,
+    "name": "Veg Salad",
+    "category": "Salad",
+    "description": "Fresh",
+    "price": "179.00",
+    "is_available": true,
+    "is_veg": true,
+    "is_vegan": false,
+    "is_spicy": false,
+    "calories": 150,
+    "allergens": [],
+    "image": "https://images.unsplash.com/photo-1546793665-c74683f339c1?w=600",
+    "created_at": "2026-07-17T10:11:19.724Z"
+  }
+}
+]
