@@ -1,5 +1,6 @@
 import hashlib
 import re
+import os
 import requests
 from django.utils import timezone
 
@@ -2558,23 +2559,35 @@ Customer:
 """
 
         # =====================================
-        # ASK OLLAMA
-        # =====================================
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "qwen2.5:1.5b",
-                "prompt": prompt,
-                "stream": False,
-                "keep_alive": "30m",
-                "options": {
-                    "temperature": 0.1,
-                    "num_predict": 300,
-                },
-            },
-        )
+# ASK QWEN THROUGH HUGGING FACE
+# =====================================
 
-        reply = response.json()["response"].strip()
+        hf_token = os.getenv("HF_TOKEN")
+
+        response = requests.post(
+            "https://router.huggingface.co/v1/chat/completions",
+             headers={
+                 "Authorization": f"Bearer {hf_token}",
+                 "Content-Type": "application/json",
+             },
+             json={
+                 "model": "Qwen/Qwen2.5-7B-Instruct",
+                 "messages": [
+                     {
+                         "role": "user",
+                         "content": prompt,
+                     }
+                 ],
+                 "temperature": 0.1,
+                 "max_tokens": 300,
+             },
+             timeout=60,
+)
+
+response.raise_for_status()
+
+reply = response.json()["choices"][0]["message"]["content"].strip()
+        
 
         # =====================================
         # AI ACTION : ADD TO CART
