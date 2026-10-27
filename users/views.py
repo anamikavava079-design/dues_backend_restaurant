@@ -2795,6 +2795,116 @@ def handle_place_order(customer_id, payment_label, payment_key):
     )
 
 
+# ==========================================
+# FAQs -- answered from the Restaurant record, no AI needed
+# ==========================================
+# PDF: "Handle FAQs: delivery areas, operating hours, payment methods,
+# parking"
+
+_FAQ_PATTERNS = [
+    ("parking", re.compile(r"\b(parking|park my|valet)\b", re.IGNORECASE)),
+    (
+        "hours",
+        re.compile(
+            r"\b(opening|closing|open|close|timings?|working hours|business hours|opening hours)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "delivery",
+        re.compile(
+            r"\b(do you deliver|delivery areas?|deliver to|delivery radius|how far do you deliver|delivery charge|delivery fee)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "payment",
+        re.compile(
+            r"\b(payment methods?|pay(?:ment)? options?|accept (?:upi|cards?|cash)|do you accept|can i pay|how (?:can|do) i pay)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "contact",
+        re.compile(
+            r"\b(phone number|contact|call you|email|where are you|located|location|your address|restaurant address)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+
+def _faq_topic(message_lower):
+    for topic, pattern in _FAQ_PATTERNS:
+        if pattern.search(message_lower):
+            return topic
+    return None
+
+
+def handle_faq(topic):
+    restaurant = Restaurant.objects.first()
+
+    if not restaurant:
+        return Response(
+            {"reply": "Sorry, restaurant details aren't available right now."},
+            status=status.HTTP_200_OK,
+        )
+
+    def fmt_time(value):
+        return value.strftime("%I:%M %p") if value else None
+
+    if topic == "parking":
+        reply = (
+            f"\U0001F17F️ Parking: {restaurant.parking_info}"
+            if restaurant.parking_info
+            else "\U0001F17F️ Please call us at "
+            f"{restaurant.phone} for parking details."
+        )
+
+    elif topic == "hours":
+        opens, closes = fmt_time(restaurant.open_time), fmt_time(restaurant.close_time)
+        reply = (
+            f"\U0001F552 We're open from {opens} to {closes}."
+            if opens and closes
+            else f"\U0001F552 Please call us at {restaurant.phone} for today's timings."
+        )
+
+    elif topic == "delivery":
+        areas = ", ".join(restaurant.delivery_areas or [])
+        reply = f"\U0001F6F5 We deliver within {restaurant.delivery_radius_km} km of our restaurant"
+        reply += f" -- including {areas}." if areas else "."
+        reply += (
+            f"\nAddress: {restaurant.address}, {restaurant.city}\n"
+            "A delivery fee of ₹40 applies to each order."
+        )
+
+    elif topic == "payment":
+        methods = restaurant.payment_methods_offered or []
+        labels = {
+            "upi": "UPI",
+            "card": "Credit / Debit card",
+            "cod": "Cash on delivery",
+            "cash": "Cash on delivery",
+            "wallet": "Digital wallets",
+        }
+        names = [labels.get(str(m).lower(), str(m)) for m in methods] or [
+            "UPI",
+            "Credit / Debit card",
+            "Cash on delivery",
+        ]
+        reply = "\U0001F4B3 We accept: " + ", ".join(names) + ".\n" + _PAYMENT_PROMPT
+
+    else:  # contact
+        reply = (
+            f"\U0001F4CD {restaurant.name}\n"
+            f"{restaurant.address}, {restaurant.city}, {restaurant.state}\n"
+            f"\U0001F4DE {restaurant.phone}\n"
+            f"✉️ {restaurant.email}"
+        )
+
+    return Response({"reply": reply}, status=status.HTTP_200_OK)
+
+
 def _has_any_phrase(message_lower, phrases):
     """Whole-word phrase match, so 'eta' doesn't match 'vegetarian'."""
     return any(
@@ -2859,6 +2969,10 @@ def detect_fast_path_response(message, message_lower, customer_id):
 
     if _OFFERS_RE.search(message_lower):
         return handle_show_offers(customer_id)
+
+    faq_topic = _faq_topic(message_lower)
+    if faq_topic:
+        return handle_faq(faq_topic)
 
     # "show desserts" is a menu request, not a sweet-tooth mood
     if re.search(r"\b(show|see|list)\b", message_lower) and _MENU_RE.search(message_lower):
