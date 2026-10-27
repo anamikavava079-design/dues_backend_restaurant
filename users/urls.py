@@ -62,6 +62,21 @@ urlpatterns = [
     ),
 
     # ==========================================
+    # KITCHEN DISPLAY (staff only)
+    # ==========================================
+    path(
+        "kitchen/orders/",
+        views.kitchen_orders,
+        name="kitchen_orders",
+    ),
+
+    path(
+        "kitchen/orders/status/",
+        views.kitchen_update_order,
+        name="kitchen_update_order",
+    ),
+
+    # ==========================================
     # GET CUSTOMER ORDERS
     # ==========================================
     path(
