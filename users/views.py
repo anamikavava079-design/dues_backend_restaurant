@@ -1211,18 +1211,18 @@ def handle_add_to_cart(customer_id, item_names, quantities, customizations):
 
     serializer = CartSerializer(cart)
 
-    reply_message = "\u2705 Added to your cart:\n\n"
+    reply_message = "✅ Added to your cart:\n\n"
     reply_message += "\n".join(added_items)
 
     if upsell_items:
-        reply_message += "\n\n\U0001F37D\uFE0F You may also like:\n"
+        reply_message += "\n\n\U0001F37D️ You may also like:\n"
 
         shown = set()
 
         for item in upsell_items:
             if item.name not in shown:
                 shown.add(item.name)
-                reply_message += f"\n\u2022 {item.name} - \u20B9{item.price}"
+                reply_message += f"\n• {item.name} - ₹{item.price}"
 
     return Response(
         {"reply": reply_message, "cart": serializer.data},
@@ -1280,7 +1280,7 @@ def handle_remove_from_cart(customer_id, item_name, quantity_str):
 
         return Response(
             {
-                "reply": f"\U0001F5D1\uFE0F Removed all {menu_item.name} from your cart.",
+                "reply": f"\U0001F5D1️ Removed all {menu_item.name} from your cart.",
                 "cart": serializer.data,
             },
             status=status.HTTP_200_OK,
@@ -1299,7 +1299,7 @@ def handle_remove_from_cart(customer_id, item_name, quantity_str):
 
         return Response(
             {
-                "reply": f"\u2796 Removed {quantity} x {menu_item.name} from your cart.",
+                "reply": f"➖ Removed {quantity} x {menu_item.name} from your cart.",
                 "cart": serializer.data,
             },
             status=status.HTTP_200_OK,
@@ -1311,7 +1311,7 @@ def handle_remove_from_cart(customer_id, item_name, quantity_str):
 
     return Response(
         {
-            "reply": f"\U0001F5D1\uFE0F Removed all {menu_item.name} from your cart.",
+            "reply": f"\U0001F5D1️ Removed all {menu_item.name} from your cart.",
             "cart": serializer.data,
         },
         status=status.HTTP_200_OK,
@@ -1378,7 +1378,7 @@ def handle_reorder_last_order(customer_id):
     reply = "\U0001F504 Reordered your previous order:\n\n" + "\n".join(added_items)
 
     if skipped_items:
-        reply += "\n\n\u26A0\uFE0F No longer available: " + ", ".join(skipped_items)
+        reply += "\n\n⚠️ No longer available: " + ", ".join(skipped_items)
 
     return Response(
         {
@@ -1440,16 +1440,16 @@ def handle_delivery_eta(customer_id):
 
     if order.status == "Placed":
         eta = "30 minutes"
-        message_text = "\U0001F6CD\uFE0F Your order has been placed."
+        message_text = "\U0001F6CD️ Your order has been placed."
     elif order.status == "Preparing":
         eta = "20 minutes"
-        message_text = "\U0001F468\u200D\U0001F373 Your food is being prepared."
+        message_text = "\U0001F468‍\U0001F373 Your food is being prepared."
     elif order.status == "Out for Delivery":
         eta = "10 minutes"
         message_text = "\U0001F6F5 Your order is out for delivery."
     else:
         return Response(
-            {"reply": "\u2705 Your order has already been delivered."},
+            {"reply": "✅ Your order has already been delivered."},
             status=status.HTTP_200_OK,
         )
 
@@ -1457,7 +1457,7 @@ def handle_delivery_eta(customer_id):
         {
             "reply": (
                 f"{message_text}\n\n"
-                f"\u23F1\uFE0F Estimated delivery time: {eta}"
+                f"⏱️ Estimated delivery time: {eta}"
             )
         },
         status=status.HTTP_200_OK,
@@ -1574,7 +1574,7 @@ def handle_book_table(customer_id, date_text, time_text, guests_text):
     return Response(
         {
             "reply": (
-                "\u2705 Your table has been booked!\n\n"
+                "✅ Your table has been booked!\n\n"
                 f"\U0001F4C5 Date: {booking.booking_date}\n"
                 f"\U0001F552 Time: {booking.booking_time}\n"
                 f"\U0001F465 Guests: {booking.guests}"
@@ -1644,7 +1644,7 @@ def handle_modify_booking(customer_id, date_text, time_text, guests_text):
     return Response(
         {
             "reply": (
-                "\u2705 Your booking has been updated successfully!\n\n"
+                "✅ Your booking has been updated successfully!\n\n"
                 f"\U0001F4C5 Date: {booking.booking_date}\n"
                 f"\U0001F552 Time: {booking.booking_time}\n"
                 f"\U0001F465 Guests: {booking.guests}"
@@ -1684,7 +1684,7 @@ def handle_cancel_booking(customer_id):
     return Response(
         {
             "reply": (
-                "\u274C Your booking has been cancelled successfully.\n\n"
+                "❌ Your booking has been cancelled successfully.\n\n"
                 f"\U0001F4C5 Date: {booking.booking_date}\n"
                 f"\U0001F552 Time: {booking.booking_time}"
             )
@@ -1708,7 +1708,7 @@ def handle_mood_recommendation(message_lower):
             # request reach the LLM -- which then hallucinated dish names
             # that don't exist in the menu. A recognized mood with no
             # matching stock must be answered here, deterministically,
-            # never handed off to Ollama.
+            # never handed off to the LLM.
             if not items:
                 return Response(
                     {
@@ -1723,7 +1723,7 @@ def handle_mood_recommendation(message_lower):
 
             reply = "\U0001F60B Based on your mood, here's what I'd suggest:\n\n"
             for item in items:
-                reply += f"\u2022 {item.name} - \u20B9{item.price}\n"
+                reply += f"• {item.name} - ₹{item.price}\n"
 
             return Response({"reply": reply}, status=status.HTTP_200_OK)
 
@@ -1765,7 +1765,7 @@ def handle_submit_feedback(customer_id, message, message_lower):
         return Response(
             {
                 "reply": (
-                    "\u2B50 I'd love your feedback! Please rate your last order "
+                    "⭐ I'd love your feedback! Please rate your last order "
                     "from 1 to 5 stars, e.g. 'feedback 5 stars, loved the biryani'."
                 )
             },
@@ -1878,7 +1878,7 @@ def handle_checkout_cart(customer_id):
         )
 
     reply = (
-        "🛒 Your cart is ready for checkout!\n\n"
+        "\U0001F6D2 Your cart is ready for checkout!\n\n"
         + "\n".join(lines)
         + f"\n\nTotal: ₹{total:.2f}\n\n"
         + "Please continue to checkout to enter your delivery details "
@@ -2011,6 +2011,37 @@ def handle_leave_waitlist(customer_id):
     )
 
 
+# ==========================================
+# SHOW MENU WITHOUT CALLING THE AI
+# ==========================================
+
+_MENU_RE = re.compile(
+    r"\b(menu|what do you have|what's available|whats available)\b",
+    re.IGNORECASE,
+)
+
+
+def handle_show_menu():
+    items = MenuItem.objects.filter(is_available=True).order_by("category", "name")
+
+    if not items:
+        return Response(
+            {"reply": "The menu is empty right now."},
+            status=status.HTTP_200_OK,
+        )
+
+    lines = ["\U0001F37D️ Here's our menu:"]
+    current = None
+
+    for item in items:
+        if item.category != current:
+            current = item.category
+            lines.append(f"\n{current}")
+        lines.append(f"• {item.name} - ₹{item.price}")
+
+    return Response({"reply": "\n".join(lines)}, status=status.HTTP_200_OK)
+
+
 def detect_fast_path_response(message, message_lower, customer_id):
     """
     Deterministic, regex + DB based short-circuit for the chatbot's core
@@ -2092,6 +2123,69 @@ def detect_fast_path_response(message, message_lower, customer_id):
                 customer_id, item_names, quantities, customizations
             )
 
+    # "show menu" / "browse the menu" is answered here, without the AI
+    if _MENU_RE.search(message_lower):
+        return handle_show_menu()
+
+    return None
+
+
+# ==========================================
+# HUGGING FACE LLM CALL
+# ==========================================
+
+# Tried in order; if one model is unavailable on the Hugging Face router
+# (it returns 400/404 for unsupported models), the next one is used.
+HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_MODELS = [
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+]
+
+
+def ask_llm(prompt):
+    """
+    Returns the model's reply text, or None if every model failed.
+    Errors are printed to the server logs (Vercel -> Logs) and are never
+    shown to the customer.
+    """
+    hf_token = os.getenv("HF_TOKEN")
+
+    if not hf_token:
+        print("Chatbot error: HF_TOKEN environment variable is not set")
+        return None
+
+    for model_name in HF_MODELS:
+        try:
+            response = requests.post(
+                HF_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {hf_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 300,
+                },
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            print("HF request failed:", model_name, e)
+            continue
+
+        if not response.ok:
+            print("HF error:", model_name, response.status_code, response.text[:500])
+            continue
+
+        try:
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            print("HF bad response:", model_name, e, response.text[:500])
+            continue
+
     return None
 
 
@@ -2139,11 +2233,11 @@ def chatbot(request):
             total += subtotal
 
             reply += (
-                f"\u2022 {item.menu_item.name} x {item.quantity}"
-                f" - \u20B9{subtotal:.2f}\n"
+                f"• {item.menu_item.name} x {item.quantity}"
+                f" - ₹{subtotal:.2f}\n"
             )
 
-        reply += f"\nTotal : \u20B9{total:.2f}"
+        reply += f"\nTotal : ₹{total:.2f}"
 
         return Response({
             "reply": reply
@@ -2307,7 +2401,7 @@ def chatbot(request):
                 calories = item.calories if item.calories else "N/A"
 
                 menu_lines.append(
-                    f"- {item.name} | {item.category} | \u20B9{item.price} | "
+                    f"- {item.name} | {item.category} | ₹{item.price} | "
                     f"{diet_tag}{spice_tag} | Allergens: {allergens} | Calories: {calories}"
                 )
 
@@ -2360,7 +2454,7 @@ Latest Order ID : {latest_order.id}
 
 Status : {latest_order.status}
 
-Total Price : \u20B9{latest_order.total_price}
+Total Price : ₹{latest_order.total_price}
 
 Items:
 {items_text}
@@ -2544,6 +2638,31 @@ Valid actions: ADD_TO_CART, REMOVE_FROM_CART, BOOK_TABLE, MODIFY_BOOKING,
 CANCEL_BOOKING, DELIVERY_ETA, GO_TO_CHECKOUT, REORDER_LAST_ORDER,
 SUBMIT_FEEDBACK, JOIN_WAITLIST, WAITLIST_STATUS, LEAVE_WAITLIST.
 
+When an ACTION is required, reply with ONLY the action block and nothing else,
+using exactly these formats:
+
+ACTION: ADD_TO_CART
+ITEM: <exact menu item name>
+QUANTITY: <number>
+CUSTOMIZATION: <text, or NONE>
+(repeat the ITEM / QUANTITY / CUSTOMIZATION lines for each extra item)
+
+ACTION: REMOVE_FROM_CART
+ITEM: <exact menu item name>
+QUANTITY: <number, or ALL>
+
+ACTION: BOOK_TABLE
+DATE: <today, tomorrow, a weekday name, or YYYY-MM-DD>
+TIME: <e.g. 8 PM>
+GUESTS: <number>
+
+ACTION: MODIFY_BOOKING
+DATE: <new date, or SAME>
+TIME: <new time, or SAME>
+GUESTS: <new number, or SAME>
+
+For every other action, reply with just the line "ACTION: <NAME>".
+
 Use ONLY the information provided in this prompt. Never invent menu items,
 prices, restaurant details, promotions, bookings, orders, or cart items.
 
@@ -2552,35 +2671,21 @@ Customer:
 """
 
         # =====================================
-        # ASK QWEN THROUGH HUGGING FACE
+        # ASK THE LLM THROUGH HUGGING FACE
         # =====================================
 
-        hf_token = os.getenv("HF_TOKEN")
+        reply = ask_llm(prompt)
 
-        response = requests.post(
-            "https://router.huggingface.co/v1/chat/completions",
-             headers={
-                 "Authorization": f"Bearer {hf_token}",
-                 "Content-Type": "application/json",
-             },
-             json={
-                 "model": "Qwen/Qwen2.5-7B-Instruct",
-                 "messages": [
-                     {
-                         "role": "user",
-                         "content": prompt,
-                     }
-                 ],
-                 "temperature": 0.1,
-                 "max_tokens": 300,
-             },
-             timeout=60,
-)
-
-        response.raise_for_status()
-
-        reply = response.json()["choices"][0]["message"]["content"].strip()
-        
+        if reply is None:
+            return Response(
+                {
+                    "reply": (
+                        "Sorry, I couldn't reach the AI assistant right now. "
+                        "You can type 'show menu' or 'show cart', or use the Menu page."
+                    )
+                },
+                status=status.HTTP_200_OK,
+            )
 
         # =====================================
         # AI ACTION : ADD TO CART
@@ -2711,7 +2816,9 @@ Customer:
         )
 
     except Exception as e:
+        # Log the real error, show a friendly message to the customer
+        print("Chatbot error:", e)
         return Response(
-            {"reply": str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            {"reply": "Sorry, something went wrong. Please try again."},
+            status=status.HTTP_200_OK,
         )
