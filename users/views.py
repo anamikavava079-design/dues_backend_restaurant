@@ -127,6 +127,8 @@ def login_customer(request):
                 "id": user.id,
                 "name": user.name,
                 "email": user.email,
+                # lets the frontend show staff-only pages (Kitchen)
+                "role": user.role,
             },
             status=status.HTTP_200_OK,
         )
@@ -289,6 +291,98 @@ def create_order(request):
 # GET ORDERS API
 # ==========================================
 
+# Orders move Placed -> Preparing -> Out for Delivery -> Delivered on a
+# timer (demo simulation). The kitchen can step in: "Delayed" holds the
+# order until staff mark it Out for Delivery / Delivered.
+_FINAL_OR_HELD_STATUSES = ["Cancelled", "Delayed", "Delivered"]
+_KITCHEN_STATUSES = ["Preparing", "Delayed", "Out for Delivery", "Delivered", "Cancelled"]
+
+
+def _refresh_order_status(order):
+    if order.status in _FINAL_OR_HELD_STATUSES:
+        return order
+
+    minutes = (timezone.now() - order.created_at).total_seconds() / 60
+
+    if minutes < 1:
+        new_status = "Placed"
+    elif minutes < 2:
+        new_status = "Preparing"
+    elif minutes < 3:
+        new_status = "Out for Delivery"
+    else:
+        new_status = "Delivered"
+
+    # never move an order backwards (e.g. after the kitchen sent it out)
+    order_flow = ["Placed", "Preparing", "Out for Delivery", "Delivered"]
+    if order_flow.index(new_status) > order_flow.index(order.status):
+        order.status = new_status
+        order.save(update_fields=["status"])
+
+    return order
+
+
+# ==========================================
+# KITCHEN DISPLAY (staff only)
+# ==========================================
+# PDF: "Order sent to POS/kitchen system" and "notify on delays".
+
+@api_view(["GET"])
+def kitchen_orders(request):
+    if not _is_staff(request.GET.get("staff_id")):
+        return Response(
+            {"error": "Only restaurant staff can view the kitchen."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    orders = Order.objects.select_related("customer").order_by("-created_at")[:50]
+
+    data = []
+    for order in orders:
+        _refresh_order_status(order)
+        row = OrderSerializer(order).data
+        row["customer_name"] = order.customer.name
+        row["customer_phone"] = order.customer.phone
+        row["delivery_address"] = order.customer.address
+        data.append(row)
+
+    return Response(data)
+
+
+@api_view(["POST"])
+def kitchen_update_order(request):
+    if not _is_staff(request.data.get("staff_id")):
+        return Response(
+            {"error": "Only restaurant staff can update orders."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    new_status = request.data.get("status")
+
+    if new_status not in _KITCHEN_STATUSES:
+        return Response(
+            {"error": f"status must be one of: {', '.join(_KITCHEN_STATUSES)}"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    order = Order.objects.filter(id=request.data.get("order_id")).first()
+
+    if not order:
+        return Response(
+            {"error": "Order not found."}, status=status.HTTP_404_NOT_FOUND
+        )
+
+    order.status = new_status
+    order.save(update_fields=["status"])
+
+    return Response(
+        {
+            "message": f"Order #{order.id} is now {new_status}.",
+            "order": OrderSerializer(order).data,
+        }
+    )
+
+
 @api_view(["GET"])
 def get_orders(request):
     customer_id = request.GET.get("customer_id")
@@ -300,29 +394,8 @@ def get_orders(request):
     else:
         orders = Order.objects.none()
 
-    now = timezone.now()
-
     for order in orders:
-        if order.status == "Cancelled":
-            continue
-
-        minutes = (now - order.created_at).total_seconds() / 60
-
-        if minutes < 1:
-            new_status = "Placed"
-
-        elif minutes < 2:
-            new_status = "Preparing"
-
-        elif minutes < 3:
-            new_status = "Out for Delivery"
-
-        else:
-            new_status = "Delivered"
-
-        if order.status != new_status:
-            order.status = new_status
-            order.save(update_fields=["status"])
+        _refresh_order_status(order)
 
     serializer = OrderSerializer(orders, many=True)
 
@@ -1271,6 +1344,7 @@ def handle_add_to_cart(customer_id, item_names, quantities, customizations):
     cart, _ = Cart.objects.get_or_create(customer=customer)
 
     added_items = []
+    added_menu_items = []
     upsell_items = []
 
     for index, item_name in enumerate(item_names):
@@ -1318,6 +1392,8 @@ def handle_add_to_cart(customer_id, item_names, quantities, customizations):
         else:
             added_items.append(f"{quantity} x {menu_item.name}")
 
+        added_menu_items.append(menu_item)
+
         recommendations = get_upsell_items(menu_item)
 
         for rec in recommendations:
@@ -1345,8 +1421,8 @@ def handle_add_to_cart(customer_id, item_names, quantities, customizations):
                 shown.add(item.name)
                 reply_message += f"\n• {item.name} - ₹{item.price}"
 
-    # PDF: "Share tailored promotions ... during active chats"
-    promo_line = _active_promotion_line()
+    # PDF: "Upsell ... combos" + "Share tailored promotions during active chats"
+    promo_line = _promotion_line(customer_id, added_menu_items)
     if promo_line:
         reply_message += f"\n\n{promo_line}"
 
@@ -1550,21 +1626,20 @@ def handle_delivery_eta(customer_id):
             {"reply": "Your last order was cancelled."}, status=status.HTTP_200_OK
         )
 
-    now = timezone.now()
-    minutes = (now - order.created_at).total_seconds() / 60
+    _refresh_order_status(order)
 
-    if minutes < 1:
-        new_status = "Placed"
-    elif minutes < 2:
-        new_status = "Preparing"
-    elif minutes < 3:
-        new_status = "Out for Delivery"
-    else:
-        new_status = "Delivered"
-
-    if order.status != new_status:
-        order.status = new_status
-        order.save(update_fields=["status"])
+    if order.status == "Delayed":
+        return Response(
+            {
+                "reply": (
+                    f"⚠️ Sorry -- order #{order.id} is running a little late. "
+                    "The kitchen is on it and it should reach you in about "
+                    "15 more minutes. I'll update you here as soon as it's "
+                    "on the way."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
 
     if order.status == "Placed":
         eta = "30 minutes"
@@ -1589,6 +1664,46 @@ def handle_delivery_eta(customer_id):
             )
         },
         status=status.HTTP_200_OK,
+    )
+
+
+def _party_food_package(guests):
+    """
+    PDF: "Streamline private event / large party reservations with food
+    and beverage options" -- a suggested pre-order for the group, sized
+    by the number of guests, using dishes that are actually on the menu.
+    """
+    def first_in(categories):
+        return (
+            MenuItem.objects.filter(category__in=categories, is_available=True)
+            .order_by("price")
+            .first()
+        )
+
+    plan = [
+        (first_in(["Pizza"]), -(-guests // 3)),           # 1 pizza per 3 guests
+        (first_in(["Pasta", "Biryani"]), -(-guests // 3)),
+        (first_in(["Salad"]), -(-guests // 4)),
+        (first_in(["Drink"]), guests),                    # a drink each
+        (first_in(["Dessert"]), -(-guests // 2)),
+    ]
+
+    lines = []
+    total = 0
+
+    for menu_item, quantity in plan:
+        if menu_item:
+            subtotal = float(menu_item.price) * quantity
+            total += subtotal
+            lines.append(f"• {quantity} x {menu_item.name} - ₹{subtotal:.0f}")
+
+    if not lines:
+        return ""
+
+    return (
+        f"\U0001F37D️ Suggested party package for {guests} guests:\n"
+        + "\n".join(lines)
+        + f"\nEstimated total: ₹{total:.0f} (about ₹{total / guests:.0f} per person)\n\n"
     )
 
 
@@ -1683,8 +1798,9 @@ def handle_book_table(customer_id, date_text, time_text, guests_text):
                     f"\U0001F4C5 Date: {booking.booking_date}\n"
                     f"\U0001F552 Time: {booking.booking_time}\n"
                     f"\U0001F465 Guests: {booking.guests}\n\n"
-                    "Our team will reach out to confirm availability and discuss "
-                    f"food & beverage options for your event. You can also call us at {restaurant.phone}."
+                    f"{_party_food_package(guests)}"
+                    "Our team will reach out to confirm availability and finalise "
+                    f"the food & beverage package. You can also call us at {restaurant.phone}."
                 )
             },
             status=status.HTTP_201_CREATED,
@@ -2405,24 +2521,76 @@ _OFFERS_RE = re.compile(
 )
 
 
+LOYALTY_ORDER_COUNT = 3
+
+
 def _active_promotions():
     return Promotion.objects.filter(
         is_active=True, valid_until__gte=timezone.localdate()
     ).order_by("valid_until")
 
 
-def _active_promotion_line():
-    promo = _active_promotions().first()
+def _order_count(customer_id):
+    if not customer_id:
+        return 0
+    return (
+        Order.objects.filter(customer_id=customer_id)
+        .exclude(status="Cancelled")
+        .count()
+    )
 
-    if not promo:
+
+def _offers_for(customer_id):
+    """
+    PDF: "Share tailored promotions (happy hour, seasonal specials,
+    loyalty discounts)". Each customer only sees offers they can use:
+    first-order deals disappear after the first order, and loyalty deals
+    (wording mentions loyal/regular) appear after LOYALTY_ORDER_COUNT orders.
+    """
+    count = _order_count(customer_id)
+    offers = []
+
+    for promo in _active_promotions():
+        text = f"{promo.title} {promo.description}".lower()
+
+        if "first order" in text and count > 0:
+            continue
+        if re.search(r"\b(loyal|loyalty|regular)\b", text) and count < LOYALTY_ORDER_COUNT:
+            continue
+
+        offers.append(promo)
+
+    return offers
+
+
+def _promotion_line(customer_id, menu_items=()):
+    """One offer to show after adding to the cart: a combo deal for what
+    was just added if there is one, otherwise the customer's best offer."""
+    offers = _offers_for(customer_id)
+
+    if not offers:
         return ""
 
+    for menu_item in menu_items:
+        words = {menu_item.category.lower(), *menu_item.name.lower().split()}
+
+        for promo in offers:
+            text = f"{promo.title} {promo.description}".lower()
+            if "+" in text or "combo" in text:
+                if any(_singular(word) in text for word in words if len(word) >= 4):
+                    discount = f" ({promo.discount})" if promo.discount else ""
+                    return (
+                        f"\U0001F4A1 Make it a combo! {promo.title}{discount}: "
+                        f"{promo.description}"
+                    )
+
+    promo = offers[0]
     discount = f" ({promo.discount})" if promo.discount else ""
     return f"\U0001F389 Offer: {promo.title}{discount} -- valid until {promo.valid_until}"
 
 
 def handle_show_offers(customer_id):
-    promotions = list(_active_promotions())
+    promotions = _offers_for(customer_id)
 
     if not promotions:
         return Response(
@@ -2430,7 +2598,7 @@ def handle_show_offers(customer_id):
             status=status.HTTP_200_OK,
         )
 
-    lines = ["\U0001F389 Today's offers:\n"]
+    lines = ["\U0001F389 Today's offers for you:\n"]
 
     for promo in promotions:
         discount = f" -- {promo.discount}" if promo.discount else ""
@@ -2439,17 +2607,21 @@ def handle_show_offers(customer_id):
             f"   {promo.description} (valid until {promo.valid_until})"
         )
 
-    if customer_id:
-        order_count = (
-            Order.objects.filter(customer_id=customer_id)
-            .exclude(status="Cancelled")
-            .count()
+    order_count = _order_count(customer_id)
+
+    if order_count >= LOYALTY_ORDER_COUNT:
+        lines.append(
+            f"\n\U0001F49B Thanks for being a regular -- "
+            f"you've ordered with us {order_count} times!"
         )
-        if order_count >= 3:
-            lines.append(
-                f"\n\U0001F49B Thanks for being a regular -- "
-                f"you've ordered with us {order_count} times!"
-            )
+    elif customer_id:
+        remaining = LOYALTY_ORDER_COUNT - order_count
+        lines.append(
+            f"\n\U0001F49B Order {remaining} more time{'s' if remaining > 1 else ''} "
+            "to unlock our loyalty rewards!"
+        )
+
+    lines.append("\nClaim an offer on the Home page and it's applied in your cart.")
 
     return Response({"reply": "\n".join(lines)}, status=status.HTTP_200_OK)
 
@@ -3756,3 +3928,4 @@ Customer:
             {"reply": "Sorry, something went wrong. Please try again."},
             status=status.HTTP_200_OK,
         )
+s
