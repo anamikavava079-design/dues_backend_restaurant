@@ -2,6 +2,8 @@ import hashlib
 import re
 import os
 import requests
+from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from rest_framework.decorators import api_view
@@ -32,6 +34,17 @@ from .serializers import (
     ReviewSerializer,
     PromotionSerializer,
     WaitlistSerializer,
+)
+
+# "Notified" = the restaurant has told the customer their table is ready;
+# the entry is still active until they are seated or cancel.
+ACTIVE_WAITLIST_STATUSES = ["Waiting", "Notified"]
+
+STAFF_ROLES = ["admin", "support"]
+
+TABLE_READY_REPLY = (
+    "\U0001F514 Good news -- your table is ready! "
+    "Please come to the host stand and we'll seat you right away."
 )
 
 # ==========================================
@@ -682,7 +695,7 @@ def join_waitlist(request):
 
         # Prevent the same customer stacking up multiple active entries.
         existing = Waitlist.objects.filter(
-            customer=customer, status="Waiting"
+            customer=customer, status__in=ACTIVE_WAITLIST_STATUSES
         ).first()
 
         if existing:
@@ -740,7 +753,7 @@ def waitlist_status(request):
     customer_id = request.GET.get("customer_id")
 
     entry = (
-        Waitlist.objects.filter(customer_id=customer_id, status="Waiting")
+        Waitlist.objects.filter(customer_id=customer_id, status__in=ACTIVE_WAITLIST_STATUSES)
         .order_by("-joined_at")
         .first()
     )
@@ -760,6 +773,7 @@ def waitlist_status(request):
         {
             "in_queue": True,
             "position": position,
+            "table_ready": entry.status == "Notified",
             "waitlist": serializer.data,
         }
     )
@@ -770,7 +784,7 @@ def leave_waitlist(request):
     customer_id = request.data.get("customer_id")
 
     entry = (
-        Waitlist.objects.filter(customer_id=customer_id, status="Waiting")
+        Waitlist.objects.filter(customer_id=customer_id, status__in=ACTIVE_WAITLIST_STATUSES)
         .order_by("-joined_at")
         .first()
     )
@@ -785,6 +799,57 @@ def leave_waitlist(request):
     entry.save()
 
     return Response({"message": "You've been removed from the waitlist."})
+
+
+def _is_staff(user_id):
+    if not user_id:
+        return False
+    return UserProfile.objects.filter(id=user_id, role__in=STAFF_ROLES).exists()
+
+
+def _notify_waitlist_entry(waitlist_id=None):
+    """Marks one waitlist entry as 'table ready'. With no id, the customer
+    who has been waiting longest is notified. Returns the entry or None."""
+    entries = Waitlist.objects.filter(status="Waiting").order_by("joined_at")
+
+    if waitlist_id:
+        entries = entries.filter(id=waitlist_id)
+
+    entry = entries.first()
+
+    if entry:
+        entry.status = "Notified"
+        entry.save(update_fields=["status"])
+
+    return entry
+
+
+@api_view(["POST"])
+def notify_waitlist(request):
+    """
+    Restaurant staff mark a table as ready. The customer then sees
+    'your table is ready' in the chatbot and in waitlist/status/.
+    Body: {"staff_id": <admin/support user id>, "waitlist_id": <optional>}
+    """
+    if not _is_staff(request.data.get("staff_id")):
+        return Response(
+            {"error": "Only restaurant staff can notify the waitlist."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    entry = _notify_waitlist_entry(request.data.get("waitlist_id"))
+
+    if not entry:
+        return Response(
+            {"error": "No one is waiting."}, status=status.HTTP_404_NOT_FOUND
+        )
+
+    return Response(
+        {
+            "message": f"{entry.customer.name} (party of {entry.party_size}) has been notified.",
+            "waitlist": WaitlistSerializer(entry).data,
+        }
+    )
 
 
 def get_upsell_items(menu_item):
@@ -1122,6 +1187,62 @@ def _find_all_menu_items_in_message(message_lower, menu_items):
     return chosen
 
 
+# "extra cheese" / "no onions" must not be mistaken for a menu item name.
+_CUSTOMIZATION_PHRASE_RE = re.compile(
+    r"\b(?:extra|no|without)\s+[a-z]+\b", re.IGNORECASE
+)
+
+# Questions like "is the pasta spicy?" or "i want to know about pizza"
+# should go to the AI, not silently add something to the cart.
+_QUESTION_RE = re.compile(
+    r"\?|\b(what|which|how|does|is the|is there|tell me|about|price|cost|calories|allergen)\b",
+    re.IGNORECASE,
+)
+
+
+def _singular(word):
+    return word[:-1] if len(word) > 4 and word.endswith("s") else word
+
+
+def _find_menu_items_by_keyword(message_lower, menu_items):
+    """
+    Fallback when the customer types a short name instead of the full menu
+    item name, e.g. 'add a burger' -> 'Classic Burger', 'two pizzas' ->
+    'Cheese Pizza'. A keyword (a word of the item name, or its category)
+    is only used if it points to exactly ONE menu item; ambiguous words are
+    left for the AI. Positions are kept identical to message_lower so
+    _quantity_before() still works.
+    """
+    cleaned = _CUSTOMIZATION_PHRASE_RE.sub(
+        lambda m: " " * len(m.group(0)), message_lower
+    )
+
+    keyword_to_items = {}
+
+    for menu_item in menu_items:
+        words = set(re.findall(r"[a-z]+", menu_item.name.lower()))
+        words.add((menu_item.category or "").lower())
+
+        for word in words:
+            if len(word) >= 4:
+                keyword_to_items.setdefault(_singular(word), {})[menu_item.id] = menu_item
+
+    matches = []
+    seen_ids = set()
+
+    for match in re.finditer(r"[a-z]+", cleaned):
+        items = keyword_to_items.get(_singular(match.group(0)))
+
+        if items and len(items) == 1:
+            menu_item = next(iter(items.values()))
+
+            if menu_item.id not in seen_ids:
+                seen_ids.add(menu_item.id)
+                matches.append((match.start(), match.end(), menu_item))
+
+    return matches
+
+
 # ==========================================
 # SHARED ACTION HANDLERS
 # ==========================================
@@ -1223,6 +1344,13 @@ def handle_add_to_cart(customer_id, item_names, quantities, customizations):
             if item.name not in shown:
                 shown.add(item.name)
                 reply_message += f"\n• {item.name} - ₹{item.price}"
+
+    # PDF: "Share tailored promotions ... during active chats"
+    promo_line = _active_promotion_line()
+    if promo_line:
+        reply_message += f"\n\n{promo_line}"
+
+    reply_message += "\n\nSay 'checkout' when you're ready to order."
 
     return Response(
         {"reply": reply_message, "cart": serializer.data},
@@ -1881,8 +2009,13 @@ def handle_checkout_cart(customer_id):
         "\U0001F6D2 Your cart is ready for checkout!\n\n"
         + "\n".join(lines)
         + f"\n\nTotal: ₹{total:.2f}\n\n"
-        + "Please continue to checkout to enter your delivery details "
-          "and choose your payment method."
+        + (
+            f"\U0001F4CD Delivery address: {customer.address}\n\n"
+            if customer.address
+            else "\U0001F4CD Tell me where to deliver: 'deliver to <your address>'.\n\n"
+        )
+        + _PAYMENT_PROMPT
+        + "\nOr continue on the checkout page."
     )
 
     return Response(
@@ -1917,8 +2050,14 @@ def handle_join_waitlist(customer_id, message_lower):
         )
 
     existing = Waitlist.objects.filter(
-        customer=customer, status="Waiting"
+        customer=customer, status__in=ACTIVE_WAITLIST_STATUSES
     ).first()
+
+    if existing and existing.status == "Notified":
+        return Response(
+            {"reply": TABLE_READY_REPLY},
+            status=status.HTTP_200_OK,
+        )
 
     if existing:
         position = Waitlist.objects.filter(
@@ -1965,7 +2104,7 @@ def handle_waitlist_status(customer_id):
         return Response({"reply": "Please login first."}, status=status.HTTP_200_OK)
 
     entry = (
-        Waitlist.objects.filter(customer_id=customer_id, status="Waiting")
+        Waitlist.objects.filter(customer_id=customer_id, status__in=ACTIVE_WAITLIST_STATUSES)
         .order_by("-joined_at")
         .first()
     )
@@ -1975,6 +2114,9 @@ def handle_waitlist_status(customer_id):
             {"reply": "You're not currently on the waitlist."},
             status=status.HTTP_200_OK,
         )
+
+    if entry.status == "Notified":
+        return Response({"reply": TABLE_READY_REPLY}, status=status.HTTP_200_OK)
 
     position = Waitlist.objects.filter(
         restaurant=entry.restaurant, status="Waiting", joined_at__lte=entry.joined_at
@@ -1991,7 +2133,7 @@ def handle_leave_waitlist(customer_id):
         return Response({"reply": "Please login first."}, status=status.HTTP_200_OK)
 
     entry = (
-        Waitlist.objects.filter(customer_id=customer_id, status="Waiting")
+        Waitlist.objects.filter(customer_id=customer_id, status__in=ACTIVE_WAITLIST_STATUSES)
         .order_by("-joined_at")
         .first()
     )
@@ -2012,34 +2154,653 @@ def handle_leave_waitlist(customer_id):
 
 
 # ==========================================
-# SHOW MENU WITHOUT CALLING THE AI
+# MENU (with dietary tags, calories, allergens, images)
 # ==========================================
 
 _MENU_RE = re.compile(
-    r"\b(menu|what do you have|what's available|whats available)\b",
+    r"\b(menu|what do you have|what's available|whats available|"
+    r"(?:show|see|list) (?:me )?(?:the |your |all )?"
+    r"(?:pizzas?|burgers?|pastas?|biryanis?|desserts?|drinks?|salads?))\b",
     re.IGNORECASE,
 )
 
 
-def handle_show_menu():
-    items = MenuItem.objects.filter(is_available=True).order_by("category", "name")
+def _diet_label(item):
+    if item.is_vegan:
+        return "\U0001F331 Vegan"
+    if item.is_veg:
+        return "\U0001F7E2 Veg"
+    return "\U0001F534 Non-Veg"
 
-    if not items:
-        return Response(
-            {"reply": "The menu is empty right now."},
-            status=status.HTTP_200_OK,
-        )
 
-    lines = ["\U0001F37D️ Here's our menu:"]
+def _menu_item_line(item):
+    tags = [_diet_label(item)]
+
+    if item.is_spicy:
+        tags.append("\U0001F336️ Spicy")
+    if item.calories:
+        tags.append(f"{item.calories} kcal")
+
+    line = f"• {item.name} - ₹{item.price} | " + " | ".join(tags)
+
+    if item.description:
+        line += f"\n   {item.description}"
+    if item.allergens:
+        line += f"\n   ⚠️ Allergens: {', '.join(item.allergens)}"
+
+    return line
+
+
+def _menu_item_card(item):
+    """Structured item data so the chat widget can show the dish image."""
+    return {
+        "id": item.id,
+        "name": item.name,
+        "category": item.category,
+        "price": str(item.price),
+        "description": item.description,
+        "image": item.image,
+        "is_veg": item.is_veg,
+        "is_vegan": item.is_vegan,
+        "is_spicy": item.is_spicy,
+        "calories": item.calories,
+        "allergens": item.allergens,
+    }
+
+
+def _menu_response(title, items, footer=""):
+    lines = [title]
     current = None
 
     for item in items:
         if item.category != current:
             current = item.category
             lines.append(f"\n{current}")
-        lines.append(f"• {item.name} - ₹{item.price}")
+        lines.append(_menu_item_line(item))
+
+    if footer:
+        lines.append(f"\n{footer}")
+
+    return Response(
+        {
+            "reply": "\n".join(lines),
+            "menu_items": [_menu_item_card(item) for item in items],
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+def handle_show_menu(message_lower=""):
+    items = MenuItem.objects.filter(is_available=True).order_by("category", "name")
+
+    # "show the pizza menu" / "show desserts" -> only that category
+    words = {_singular(word) for word in re.findall(r"[a-z]+", message_lower)}
+    categories = [
+        category
+        for category, _label in MenuItem.CATEGORY_CHOICES
+        if category.lower() in words
+    ]
+
+    if categories:
+        items = items.filter(category__in=categories)
+
+    items = list(items)
+
+    if not items:
+        return Response(
+            {"reply": "Sorry, nothing is available in that section right now."},
+            status=status.HTTP_200_OK,
+        )
+
+    return _menu_response(
+        "\U0001F37D️ Here's our menu:",
+        items,
+        footer="Say 'add <dish>' to add something to your cart.",
+    )
+
+
+# ==========================================
+# DIETARY & PERSONAL RECOMMENDATIONS
+# ==========================================
+
+_DIET_RE = re.compile(r"\b(non[- ]?veg|vegan|vegetarian|veg)\b", re.IGNORECASE)
+
+_DIET_CONTEXT_RE = re.compile(
+    r"\b(options?|dishes|food|items|menu|something|anything|only|pure|show|suggest|recommend|do you have)\b",
+    re.IGNORECASE,
+)
+
+_PERSONAL_RE = re.compile(
+    r"\b(for me|based on my|my (?:last|previous|past) orders?|my usual|my favou?rites?|"
+    r"what should i (?:eat|order)|recommend something|suggest something)\b",
+    re.IGNORECASE,
+)
+
+
+def _wanted_diet(message_lower):
+    match = _DIET_RE.search(message_lower)
+
+    if not match:
+        return None
+
+    diet = match.group(1).lower()
+
+    if message_lower.strip(" ?!.") == diet or _DIET_CONTEXT_RE.search(message_lower):
+        return diet
+
+    return None
+
+
+def handle_dietary_menu(diet):
+    items = MenuItem.objects.filter(is_available=True).order_by("category", "name")
+
+    if diet == "vegan":
+        items = items.filter(is_vegan=True)
+        title = "\U0001F331 Our vegan dishes:"
+    elif diet.startswith("non"):
+        items = items.filter(is_veg=False, is_vegan=False)
+        title = "\U0001F534 Our non-veg dishes:"
+    else:
+        items = items.filter(Q(is_veg=True) | Q(is_vegan=True))
+        title = "\U0001F7E2 Our vegetarian dishes:"
+
+    items = list(items)
+
+    if not items:
+        return Response(
+            {"reply": "Sorry, we don't have any matching dishes right now."},
+            status=status.HTTP_200_OK,
+        )
+
+    return _menu_response(
+        title, items, footer="Say 'add <dish>' to add one to your cart."
+    )
+
+
+def handle_personal_recommendation(customer_id):
+    """Suggests dishes from the customer's saved dietary preferences and
+    their last order (similar dishes they haven't tried yet)."""
+    items = MenuItem.objects.filter(is_available=True)
+    diet_items = items
+    reasons = []
+
+    customer = (
+        UserProfile.objects.filter(id=customer_id).first() if customer_id else None
+    )
+
+    if customer:
+        prefs = " ".join(customer.dietary_preferences or []).lower()
+
+        if "vegan" in prefs:
+            items = items.filter(is_vegan=True)
+            reasons.append("your vegan preference")
+        elif "veg" in prefs and "non" not in prefs:
+            items = items.filter(Q(is_veg=True) | Q(is_vegan=True))
+            reasons.append("your vegetarian preference")
+
+        diet_items = items
+
+        last_order = (
+            Order.objects.filter(customer=customer).order_by("-created_at").first()
+        )
+
+        if last_order:
+            ordered_ids = list(
+                OrderItem.objects.filter(order=last_order).values_list(
+                    "menu_item_id", flat=True
+                )
+            )
+            categories = list(
+                MenuItem.objects.filter(id__in=ordered_ids).values_list(
+                    "category", flat=True
+                )
+            )
+
+            similar = items.filter(category__in=categories).exclude(id__in=ordered_ids)
+
+            if not similar.exists():
+                # nothing new in those categories -> their favourites again
+                similar = items.filter(id__in=ordered_ids)
+
+            if similar.exists():
+                items = similar
+                reasons.append("your last order")
+
+    picks = list(items.order_by("category", "name")[:4])
+
+    # top up with other dishes that still fit their diet
+    if len(picks) < 4:
+        picked_ids = [item.id for item in picks]
+        picks += list(
+            diet_items.exclude(id__in=picked_ids).order_by("category", "name")[
+                : 4 - len(picks)
+            ]
+        )
+
+    if not picks:
+        return Response(
+            {"reply": "Sorry, I couldn't find dishes matching your preferences right now."},
+            status=status.HTTP_200_OK,
+        )
+
+    if reasons:
+        title = f"\U0001F60B Picked for you based on {' and '.join(reasons)}:"
+    elif not customer:
+        title = "\U0001F60B Here are some of our favourites (log in for personal picks):"
+    else:
+        title = "\U0001F60B Here are some of our favourites:"
+
+    return _menu_response(
+        title, picks, footer="Say 'add <dish>' to add one to your cart."
+    )
+
+
+# ==========================================
+# PROMOTIONS / OFFERS
+# ==========================================
+
+_OFFERS_RE = re.compile(
+    r"\b(offers?|deals?|discounts?|promo(?:tion)?s?|coupons?|happy hour|specials?)\b",
+    re.IGNORECASE,
+)
+
+
+def _active_promotions():
+    return Promotion.objects.filter(
+        is_active=True, valid_until__gte=timezone.localdate()
+    ).order_by("valid_until")
+
+
+def _active_promotion_line():
+    promo = _active_promotions().first()
+
+    if not promo:
+        return ""
+
+    discount = f" ({promo.discount})" if promo.discount else ""
+    return f"\U0001F389 Offer: {promo.title}{discount} -- valid until {promo.valid_until}"
+
+
+def handle_show_offers(customer_id):
+    promotions = list(_active_promotions())
+
+    if not promotions:
+        return Response(
+            {"reply": "There are no active offers right now -- check back soon!"},
+            status=status.HTTP_200_OK,
+        )
+
+    lines = ["\U0001F389 Today's offers:\n"]
+
+    for promo in promotions:
+        discount = f" -- {promo.discount}" if promo.discount else ""
+        lines.append(
+            f"• {promo.title}{discount}\n"
+            f"   {promo.description} (valid until {promo.valid_until})"
+        )
+
+    if customer_id:
+        order_count = (
+            Order.objects.filter(customer_id=customer_id)
+            .exclude(status="Cancelled")
+            .count()
+        )
+        if order_count >= 3:
+            lines.append(
+                f"\n\U0001F49B Thanks for being a regular -- "
+                f"you've ordered with us {order_count} times!"
+            )
 
     return Response({"reply": "\n".join(lines)}, status=status.HTTP_200_OK)
+
+
+# ==========================================
+# BOOKING REMINDERS
+# ==========================================
+
+_MY_BOOKING_KEYWORDS = [
+    "my booking",
+    "my reservation",
+    "booking details",
+    "reservation details",
+    "do i have a booking",
+    "do i have a reservation",
+    "upcoming booking",
+    "booking reminder",
+]
+
+
+def _upcoming_bookings(customer_id):
+    return Booking.objects.filter(
+        customer_id=customer_id,
+        status__in=["Confirmed", "Pending"],
+        booking_date__gte=timezone.localdate(),
+    ).order_by("booking_date", "booking_time")
+
+
+def _booking_reminder_text(customer_id):
+    """Reminder shown in the chat for a booking today or tomorrow."""
+    if not customer_id:
+        return ""
+
+    booking = _upcoming_bookings(customer_id).first()
+
+    if not booking:
+        return ""
+
+    today = timezone.localdate()
+
+    if booking.booking_date == today:
+        when = "today"
+    elif booking.booking_date == today + timedelta(days=1):
+        when = "tomorrow"
+    else:
+        return ""
+
+    return (
+        f"⏰ Reminder: your table for {booking.guests} is booked {when} "
+        f"at {booking.booking_time.strftime('%I:%M %p')}."
+    )
+
+
+def handle_my_bookings(customer_id):
+    if not customer_id:
+        return Response({"reply": "Please login first."}, status=status.HTTP_200_OK)
+
+    bookings = list(_upcoming_bookings(customer_id)[:3])
+
+    if not bookings:
+        return Response(
+            {
+                "reply": (
+                    "You don't have any upcoming bookings. Say "
+                    "'book a table tomorrow at 8pm for 4 people' to make one."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    lines = ["\U0001F4C5 Your upcoming bookings:\n"]
+
+    for booking in bookings:
+        lines.append(
+            f"• {booking.booking_date} at "
+            f"{booking.booking_time.strftime('%I:%M %p')} -- "
+            f"{booking.guests} guests ({booking.status})"
+        )
+
+    reminder = _booking_reminder_text(customer_id)
+    if reminder:
+        lines.append(f"\n{reminder}")
+
+    lines.append("\nYou can say 'change my booking to 9 PM' or 'cancel my booking'.")
+
+    return Response({"reply": "\n".join(lines)}, status=status.HTTP_200_OK)
+
+
+# ==========================================
+# WAITLIST -- STAFF COMMANDS IN CHAT
+# ==========================================
+# Users with role "admin" or "support" can manage the walk-in queue
+# from the same chat window: "show waitlist", "notify next".
+
+_STAFF_NOTIFY_RE = re.compile(
+    r"\b(notify next|next table(?: is)? ready|table ready for next|call next)\b",
+    re.IGNORECASE,
+)
+_STAFF_QUEUE_RE = re.compile(r"\b(show|view|see) (?:the )?waitlist\b", re.IGNORECASE)
+
+
+def handle_staff_waitlist(message_lower):
+    if _STAFF_NOTIFY_RE.search(message_lower):
+        entry = _notify_waitlist_entry()
+
+        if not entry:
+            return Response(
+                {"reply": "No one is waiting right now."}, status=status.HTTP_200_OK
+            )
+
+        return Response(
+            {
+                "reply": (
+                    f"\U0001F514 Notified {entry.customer.name} (party of "
+                    f"{entry.party_size}) that their table is ready."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    if _STAFF_QUEUE_RE.search(message_lower):
+        entries = list(
+            Waitlist.objects.filter(status__in=ACTIVE_WAITLIST_STATUSES).order_by(
+                "joined_at"
+            )
+        )
+
+        if not entries:
+            return Response(
+                {"reply": "The waitlist is empty."}, status=status.HTTP_200_OK
+            )
+
+        lines = ["\U0001F4CB Current waitlist:\n"]
+
+        for number, entry in enumerate(entries, start=1):
+            lines.append(
+                f"{number}. {entry.customer.name} -- party of {entry.party_size} "
+                f"-- {entry.status}"
+            )
+
+        lines.append("\nSay 'notify next' when a table is free.")
+
+        return Response({"reply": "\n".join(lines)}, status=status.HTTP_200_OK)
+
+    return None
+
+
+# ==========================================
+# PLACE ORDER & PAY INSIDE THE CHAT
+# ==========================================
+
+_PAYMENT_METHODS = [
+    (
+        "Cash on Delivery",
+        "cash",
+        re.compile(r"\b(cash on delivery|cod|pay (?:with |by |in |using )?cash)\b", re.IGNORECASE),
+    ),
+    (
+        "UPI",
+        "upi",
+        re.compile(r"\b(upi|gpay|google pay|phonepe|paytm)\b", re.IGNORECASE),
+    ),
+    (
+        "Card",
+        "card",
+        re.compile(
+            r"\b(pay (?:with|by|using|via) (?:a )?(?:credit |debit )?card|card payment)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+# "do you accept UPI?" is an FAQ, not a request to pay.
+_PAYMENT_QUESTION_RE = re.compile(
+    r"\?|\b(do you|accept|available|can i|is there|which|what)\b", re.IGNORECASE
+)
+
+_ADDRESS_RE = re.compile(
+    r"\b(?:deliver(?: it)? to|my (?:delivery )?address is|delivery address is|"
+    r"change (?:my )?address to)\s+(.{5,})",
+    re.IGNORECASE,
+)
+
+# "do you deliver to Whitefield?" is a delivery-area FAQ, not an address.
+_ADDRESS_QUESTION_RE = re.compile(r"\?|\b(?:do|can|will) you\b", re.IGNORECASE)
+
+_PAYMENT_PROMPT = (
+    "To order right here in the chat, reply with 'pay with UPI', "
+    "'pay by card' or 'cash on delivery'."
+)
+
+
+def _detect_payment_method(message_lower):
+    if _PAYMENT_QUESTION_RE.search(message_lower):
+        return None
+
+    for label, key, pattern in _PAYMENT_METHODS:
+        if pattern.search(message_lower):
+            return label, key
+
+    return None
+
+
+def handle_save_address(customer_id, address):
+    if not customer_id:
+        return Response({"reply": "Please login first."}, status=status.HTTP_200_OK)
+
+    customer = UserProfile.objects.filter(id=customer_id).first()
+
+    if not customer:
+        return Response(
+            {"reply": "Customer account not found."}, status=status.HTTP_200_OK
+        )
+
+    customer.address = address.strip(" .")[:500]
+    customer.save(update_fields=["address"])
+
+    return Response(
+        {
+            "reply": (
+                f"\U0001F4CD Got it! We'll deliver to: {customer.address}\n\n"
+                f"{_PAYMENT_PROMPT}"
+            )
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+def handle_place_order(customer_id, payment_label, payment_key):
+    """
+    Turns the cart into an Order (which the kitchen sees in the Orders
+    list), records the payment method and empties the cart.
+    UPI / card payments are SIMULATED (test mode) -- there is no real
+    payment gateway connected yet.
+    """
+    if not customer_id:
+        return Response(
+            {"reply": "Please login first to place an order."},
+            status=status.HTTP_200_OK,
+        )
+
+    customer = UserProfile.objects.filter(id=customer_id).first()
+
+    if not customer:
+        return Response(
+            {"reply": "Customer account not found."}, status=status.HTTP_200_OK
+        )
+
+    cart = Cart.objects.filter(customer=customer).first()
+    cart_items = list(cart.items.select_related("menu_item")) if cart else []
+
+    if not cart_items:
+        return Response(
+            {"reply": "Your cart is empty. Add some items first, e.g. 'add a burger'."},
+            status=status.HTTP_200_OK,
+        )
+
+    unavailable = [ci.menu_item.name for ci in cart_items if not ci.menu_item.is_available]
+
+    if unavailable:
+        return Response(
+            {
+                "reply": (
+                    f"Sorry, these items are no longer available: {', '.join(unavailable)}. "
+                    "Please remove them from your cart first."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    if not customer.address:
+        return Response(
+            {
+                "reply": (
+                    "\U0001F4CD Where should we deliver? Say 'deliver to <your address>', "
+                    "then choose your payment method again."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    restaurant = cart_items[0].menu_item.restaurant
+
+    with transaction.atomic():
+        order = Order.objects.create(
+            customer=customer,
+            restaurant=restaurant,
+            total_price=0,
+        )
+
+        total = 0
+        lines = []
+
+        for cart_item in cart_items:
+            OrderItem.objects.create(
+                order=order,
+                menu_item=cart_item.menu_item,
+                quantity=cart_item.quantity,
+                price=cart_item.menu_item.price,
+                customization=cart_item.customization,
+            )
+
+            subtotal = float(cart_item.menu_item.price) * cart_item.quantity
+            total += subtotal
+
+            name = cart_item.menu_item.name
+            if cart_item.customization:
+                name += f" ({cart_item.customization})"
+            lines.append(f"{cart_item.quantity} x {name} - ₹{subtotal:.2f}")
+
+        order.total_price = total
+        order.save(update_fields=["total_price"])
+
+        cart.items.all().delete()
+
+    if payment_key == "cash":
+        payment_text = (
+            f"\U0001F4B5 Payment: Cash on Delivery -- please keep ₹{total:.2f} ready."
+        )
+    else:
+        payment_text = (
+            f"\U0001F4B3 Payment: {payment_label} -- ₹{total:.2f} paid "
+            "(test mode: payment simulated as successful)."
+        )
+
+    reply = (
+        f"✅ Order #{order.id} placed!\n\n"
+        + "\n".join(lines)
+        + f"\n\nTotal: ₹{total:.2f}\n"
+        + f"{payment_text}\n"
+        + f"\U0001F4CD Delivering to: {customer.address}\n\n"
+        + "\U0001F468‍\U0001F373 The kitchen has received your order. "
+        "Ask 'where is my order?' anytime to track it."
+    )
+
+    return Response(
+        {
+            "reply": reply,
+            "action": "ORDER_PLACED",
+            "order": OrderSerializer(order).data,
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+def _has_any_phrase(message_lower, phrases):
+    """Whole-word phrase match, so 'eta' doesn't match 'vegetarian'."""
+    return any(
+        re.search(r"\b" + re.escape(phrase) + r"\b", message_lower)
+        for phrase in phrases
+    )
 
 
 def detect_fast_path_response(message, message_lower, customer_id):
@@ -2047,6 +2808,19 @@ def detect_fast_path_response(message, message_lower, customer_id):
     Deterministic, regex + DB based short-circuit for the chatbot's core
     actions. Runs BEFORE the LLM is called.
     """
+
+    if _is_staff(customer_id):
+        staff_response = handle_staff_waitlist(message_lower)
+        if staff_response is not None:
+            return staff_response
+
+    address_match = _ADDRESS_RE.search(message)
+    if address_match and not _ADDRESS_QUESTION_RE.search(message_lower):
+        return handle_save_address(customer_id, address_match.group(1))
+
+    payment = _detect_payment_method(message_lower)
+    if payment:
+        return handle_place_order(customer_id, *payment)
 
     if any(keyword in message_lower for keyword in _CANCEL_BOOKING_KEYWORDS):
         return handle_cancel_booking(customer_id)
@@ -2064,6 +2838,9 @@ def detect_fast_path_response(message, message_lower, customer_id):
         date_text, time_text, guests_text = _extract_booking_details(message_lower)
         return handle_modify_booking(customer_id, date_text, time_text, guests_text)
 
+    if any(keyword in message_lower for keyword in _MY_BOOKING_KEYWORDS):
+        return handle_my_bookings(customer_id)
+
     if any(keyword in message_lower for keyword in _BOOK_TABLE_KEYWORDS):
         date_text, time_text, guests_text = _extract_booking_details(message_lower)
         return handle_book_table(customer_id, date_text, time_text, guests_text)
@@ -2074,11 +2851,18 @@ def detect_fast_path_response(message, message_lower, customer_id):
     if any(keyword in message_lower for keyword in _FEEDBACK_KEYWORDS):
         return handle_submit_feedback(customer_id, message, message_lower)
 
-    if any(keyword in message_lower for keyword in _TRACKING_KEYWORDS):
+    if _has_any_phrase(message_lower, _TRACKING_KEYWORDS):
         return handle_delivery_eta(customer_id)
 
     if any(keyword in message_lower for keyword in _REORDER_KEYWORDS):
         return handle_reorder_last_order(customer_id)
+
+    if _OFFERS_RE.search(message_lower):
+        return handle_show_offers(customer_id)
+
+    # "show desserts" is a menu request, not a sweet-tooth mood
+    if re.search(r"\b(show|see|list)\b", message_lower) and _MENU_RE.search(message_lower):
+        return handle_show_menu(message_lower)
 
     if _MOOD_TRIGGER_RE.search(message_lower) or _mood_phrase_present(message_lower):
         mood_response = handle_mood_recommendation(message_lower)
@@ -2087,7 +2871,9 @@ def detect_fast_path_response(message, message_lower, customer_id):
 
     if _REMOVE_TRIGGER_RE.search(message_lower):
         menu_items = list(MenuItem.objects.filter(is_available=True))
-        matches = _find_all_menu_items_in_message(message_lower, menu_items)
+        matches = _find_all_menu_items_in_message(
+            message_lower, menu_items
+        ) or _find_menu_items_by_keyword(message_lower, menu_items)
 
         if matches:
             start, _end, menu_item = matches[0]
@@ -2103,6 +2889,9 @@ def detect_fast_path_response(message, message_lower, customer_id):
     if _ADD_TRIGGER_RE.search(message_lower):
         menu_items = list(MenuItem.objects.filter(is_available=True))
         matches = _find_all_menu_items_in_message(message_lower, menu_items)
+
+        if not matches and not _QUESTION_RE.search(message_lower):
+            matches = _find_menu_items_by_keyword(message_lower, menu_items)
 
         if matches:
             single_item = len(matches) == 1
@@ -2123,9 +2912,16 @@ def detect_fast_path_response(message, message_lower, customer_id):
                 customer_id, item_names, quantities, customizations
             )
 
-    # "show menu" / "browse the menu" is answered here, without the AI
+    diet = _wanted_diet(message_lower)
+    if diet:
+        return handle_dietary_menu(diet)
+
+    if _PERSONAL_RE.search(message_lower):
+        return handle_personal_recommendation(customer_id)
+
+    # "show menu" / "browse the menu" / "show desserts" -- without the AI
     if _MENU_RE.search(message_lower):
-        return handle_show_menu()
+        return handle_show_menu(message_lower)
 
     return None
 
@@ -2143,6 +2939,27 @@ HF_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
+# Optional backup provider (free tier, same request format). Used first
+# when GROQ_API_KEY is set in the environment variables.
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = [
+    "llama-3.1-8b-instant",
+]
+
+
+def _llm_attempts():
+    attempts = []
+
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        attempts += [(GROQ_CHAT_URL, groq_key, m) for m in GROQ_MODELS]
+
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        attempts += [(HF_CHAT_URL, hf_token, m) for m in HF_MODELS]
+
+    return attempts
+
 
 def ask_llm(prompt):
     """
@@ -2150,18 +2967,18 @@ def ask_llm(prompt):
     Errors are printed to the server logs (Vercel -> Logs) and are never
     shown to the customer.
     """
-    hf_token = os.getenv("HF_TOKEN")
+    attempts = _llm_attempts()
 
-    if not hf_token:
-        print("Chatbot error: HF_TOKEN environment variable is not set")
+    if not attempts:
+        print("Chatbot error: neither GROQ_API_KEY nor HF_TOKEN is set")
         return None
 
-    for model_name in HF_MODELS:
+    for api_url, api_key, model_name in attempts:
         try:
             response = requests.post(
-                HF_CHAT_URL,
+                api_url,
                 headers={
-                    "Authorization": f"Bearer {hf_token}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
@@ -2173,17 +2990,17 @@ def ask_llm(prompt):
                 timeout=20,
             )
         except requests.RequestException as e:
-            print("HF request failed:", model_name, e)
+            print("LLM request failed:", model_name, e)
             continue
 
         if not response.ok:
-            print("HF error:", model_name, response.status_code, response.text[:500])
+            print("LLM error:", model_name, response.status_code, response.text[:500])
             continue
 
         try:
             return response.json()["choices"][0]["message"]["content"].strip()
         except (ValueError, KeyError, IndexError, TypeError) as e:
-            print("HF bad response:", model_name, e, response.text[:500])
+            print("LLM bad response:", model_name, e, response.text[:500])
             continue
 
     return None
@@ -2360,10 +3177,13 @@ def chatbot(request):
         ]
 
         if message_lower in greetings:
+            reminder = _booking_reminder_text(customer_id)
+
             return Response(
                 {
                     "reply": (
-                        f"\U0001F44B Hello! Welcome to {restaurant_name}!\n\n"
+                        (f"{reminder}\n\n" if reminder else "")
+                        + f"\U0001F44B Hello! Welcome to {restaurant_name}!\n\n"
                         "I'm FoodBot, your AI restaurant assistant.\n\n"
                         "I can help you with:\n\n"
                         "\U0001F355 Browse our menu\n"
