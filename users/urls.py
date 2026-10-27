@@ -137,8 +137,7 @@ urlpatterns = [
     ),
 
     # ==========================================
-    # WAITLIST (NEW -- views.py defines these but
-    # they weren't wired up here yet)
+    # WAITLIST
     # ==========================================
     path(
         "waitlist/join/",
@@ -156,6 +155,13 @@ urlpatterns = [
         "waitlist/leave/",
         views.leave_waitlist,
         name="leave_waitlist",
+    ),
+
+    # Staff: mark the next customer's table as ready
+    path(
+        "waitlist/notify/",
+        views.notify_waitlist,
+        name="notify_waitlist",
     ),
 
     # ==========================================
